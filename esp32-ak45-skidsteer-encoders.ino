@@ -9,19 +9,19 @@
 #include <sensor_msgs/msg/joint_state.h>
 #include "driver/twai.h"
 
-// --- WIRING PINS ---
+//WIRING PINS
 #define CAN_TX_PIN GPIO_NUM_27
 #define CAN_RX_PIN GPIO_NUM_26
 
-// --- MOTOR IDs ---
+//MOTOR IDs
 #define MOTOR_L_FRONT 1
 #define MOTOR_L_BACK  2
 #define MOTOR_R_FRONT 3
 #define MOTOR_R_BACK  4
 
-// --- ROBOT KINEMATICS ---
-#define WHEEL_RADIUS 0.05f  // meters
-#define TRACK_WIDTH  0.4f   // meters (distance between left and right wheels)
+// ROBOT PARAM
+#define WHEEL_RADIUS 0.15f  // meters
+#define TRACK_WIDTH  0.5f   // meters (distance between left and right wheels)
 
 // --- AK45 LIMITS ---
 #define P_MIN -12.5f
