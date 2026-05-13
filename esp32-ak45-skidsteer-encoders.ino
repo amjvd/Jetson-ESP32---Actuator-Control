@@ -7,29 +7,30 @@
 #include <rclc/executor.h>
 #include <geometry_msgs/msg/twist.h>
 #include <sensor_msgs/msg/joint_state.h>
+#include <rosidl_runtime_c/string_functions.h>
 #include "driver/twai.h"
 
-//WIRING PINS
+// --- WIRING PINS ---
 #define CAN_TX_PIN GPIO_NUM_27
 #define CAN_RX_PIN GPIO_NUM_26
 
-//MOTOR IDs
+// --- MOTOR IDs (Update these as needed!) ---
 #define MOTOR_L_FRONT 1
 #define MOTOR_L_BACK  2
 #define MOTOR_R_FRONT 3
 #define MOTOR_R_BACK  4
 
-// ROBOT PARAM
-#define WHEEL_RADIUS 0.15f  // meters
-#define TRACK_WIDTH  0.5f   // meters (distance between left and right wheels)
+// --- ROBOT KINEMATICS ---
+#define WHEEL_RADIUS 0.05f  // meters
+#define TRACK_WIDTH  0.4f   // meters (distance between left and right wheels)
 
-// --- AK45 LIMITS ---
+// --- AK45 PACKING LIMITS (For sending commands) ---
 #define P_MIN -12.5f
 #define P_MAX  12.5f
-#define V_MIN -6.0f
-#define V_MAX  6.0f
-#define T_MIN -34.0f
-#define T_MAX  34.0f
+#define V_MIN -30.0f
+#define V_MAX  30.0f
+#define T_MIN -18.0f
+#define T_MAX  18.0f
 #define KP_MIN 0.0f
 #define KP_MAX 500.0f
 #define KD_MIN 0.0f
@@ -40,6 +41,12 @@ rcl_subscription_t subscriber;
 rcl_publisher_t publisher;
 geometry_msgs__msg__Twist twist_msg;
 sensor_msgs__msg__JointState joint_msg;
+
+// Pre-allocated arrays for JointState
+rosidl_runtime_c__String joint_names[4];
+double joint_pos[4];
+double joint_vel[4];
+double joint_eff[4];
 
 rclc_executor_t executor;
 rcl_allocator_t allocator;
@@ -63,7 +70,7 @@ void error_loop(){
  }
 }
 
-// Float to Unsigned Integer Conversion
+// Float to Unsigned Integer Conversion (For Packing Commands)
 int float_to_uint(float x, float x_min, float x_max, int bits) {
   float span = x_max - x_min;
   float offset = x_min;
@@ -72,7 +79,7 @@ int float_to_uint(float x, float x_min, float x_max, int bits) {
   return (int) ((x - offset) * ((float)((1 << bits) - 1)) / span);
 }
 
-// Unsigned Integer to Float Conversion (for Encoder Parsing)
+// Unsigned Integer to Float Conversion (For Parsing Encoders)
 float uint_to_float(int x_int, float x_min, float x_max, int bits) {
   float span = x_max - x_min;
   float offset = x_min;
@@ -102,6 +109,7 @@ void init_motor(uint8_t id) {
   delay(10);
 }
 
+// Pack and Send MIT Command
 void pack_cmd(uint8_t id, float p_des, float v_des, float kp, float kd, float t_ff) {
   p_des = constrain(p_des, P_MIN, P_MAX);
   v_des = constrain(v_des, V_MIN, V_MAX);
@@ -161,35 +169,79 @@ void setup() {
   RCCHECK(rclc_subscription_init_default(
     &subscriber, &node, ROSIDL_GET_MSG_TYPE_SUPPORT(geometry_msgs, msg, Twist), "cmd_vel"));
     
-  // JointState Publisher (for Encoders)
+  // JointState Publisher
   RCCHECK(rclc_publisher_init_default(
     &publisher, &node, ROSIDL_GET_MSG_TYPE_SUPPORT(sensor_msgs, msg, JointState), "joint_states"));
+    
+  // Configure JointState arrays
+  joint_msg.name.capacity = 4;
+  joint_msg.name.size = 4;
+  joint_msg.name.data = joint_names;
+  rosidl_runtime_c__String__assign(&joint_msg.name.data[0], "front_left");
+  rosidl_runtime_c__String__assign(&joint_msg.name.data[1], "back_left");
+  rosidl_runtime_c__String__assign(&joint_msg.name.data[2], "front_right");
+  rosidl_runtime_c__String__assign(&joint_msg.name.data[3], "back_right");
+
+  joint_msg.position.capacity = 4;
+  joint_msg.position.size = 4;
+  joint_msg.position.data = joint_pos;
+
+  joint_msg.velocity.capacity = 4;
+  joint_msg.velocity.size = 4;
+  joint_msg.velocity.data = joint_vel;
+
+  joint_msg.effort.capacity = 4;
+  joint_msg.effort.size = 4;
+  joint_msg.effort.data = joint_eff;
     
   RCCHECK(rclc_executor_init(&executor, &support.context, 1, &allocator));
   RCCHECK(rclc_executor_add_subscription(&executor, &subscriber, &twist_msg, &cmd_vel_callback, ON_NEW_DATA));
 }
 
+void unpack_reply(twai_message_t *rx_msg) {
+  // Enforce exactly 8 byte DLC per the AK45 manual
+  if (rx_msg->data_length_code != 8) return;
+
+  int id = rx_msg->data[0];
+  int p_int = (rx_msg->data[1] << 8) | rx_msg->data[2];
+  int v_int = (rx_msg->data[3] << 4) | (rx_msg->data[4] >> 4);
+  int i_int = ((rx_msg->data[4] & 0xF) << 8) | rx_msg->data[5];
+  int t_int = rx_msg->data[6];
+  
+  // Use bounds from the provided manual snippet
+  float pos = uint_to_float(p_int, P_MIN, P_MAX, 16);
+  float vel = uint_to_float(v_int, V_MIN, V_MAX, 12);
+  float torque = uint_to_float(i_int, -T_MAX, T_MAX, 12);
+  float temp = (float)t_int - 40.0f; // Temperature -40~215
+  
+  // Route data to the correct joint index
+  int idx = -1;
+  if (id == MOTOR_L_FRONT) idx = 0;
+  else if (id == MOTOR_L_BACK) idx = 1;
+  else if (id == MOTOR_R_FRONT) idx = 2;
+  else if (id == MOTOR_R_BACK) idx = 3;
+  
+  if (idx != -1) {
+      joint_pos[idx] = pos;
+      joint_vel[idx] = vel;
+      joint_eff[idx] = torque;
+  }
+}
+
 void read_can_and_publish() {
   twai_message_t rx_msg;
-  // Read all available messages in the buffer
+  bool new_data_received = false;
+  
+  // Read all available CAN messages from buffer
   while (twai_receive(&rx_msg, 0) == ESP_OK) {
-    // AK45 typical MIT response: identifier is 0, data[0] is motor ID
-    // data[1..2] pos, data[3..4] vel, data[5..6] torque
-    if (rx_msg.identifier == 0 && rx_msg.data_length_code == 6) { // Usually ID 0 for master, but depends on exact AK firmware
-       uint8_t id = rx_msg.data[0];
-       int p_int = (rx_msg.data[1] << 8) | rx_msg.data[2];
-       int v_int = (rx_msg.data[3] << 4) | (rx_msg.data[4] >> 4);
-       int t_int = ((rx_msg.data[4] & 0xF) << 8) | rx_msg.data[5];
-       
-       float pos = uint_to_float(p_int, P_MIN, P_MAX, 16);
-       float vel = uint_to_float(v_int, V_MIN, V_MAX, 12);
-       float torque = uint_to_float(t_int, T_MIN, T_MAX, 12);
-       
-       // Populate and publish JointState (Simplified for example)
-       // Note: In real setup, you'd allocate strings for joint names.
-       // joint_msg.position.data[0] = pos;
-       // rcl_publish(&publisher, &joint_msg, NULL);
-    }
+      unpack_reply(&rx_msg);
+      new_data_received = true;
+  }
+  
+  // If we got new encoder data this cycle, publish it to Jetson
+  if (new_data_received) {
+      // (Optional) Populate joint_msg.header.stamp if you have synced time
+      rcl_publish(&publisher, &joint_msg, NULL);
   }
 }
 
@@ -218,13 +270,15 @@ void loop() {
       float w_left  = v_left / WHEEL_RADIUS;
       float w_right = v_right / WHEEL_RADIUS;
       
-      // Send commands to all 4 motors (assuming right motors might need to spin backwards physically, multiply by -1 if needed)
+      // Send commands to all 4 motors
+      // Note: Right side wheels are typically mirrored on the chassis,
+      // so you may need to invert the command (send -w_right) depending on hardware mounting!
       pack_cmd(MOTOR_L_FRONT, 0.0, w_left,  0.0, 2.0, 0.0);
       pack_cmd(MOTOR_L_BACK,  0.0, w_left,  0.0, 2.0, 0.0);
-      pack_cmd(MOTOR_R_FRONT, 0.0, w_right, 0.0, 2.0, 0.0); // you may need -w_right here depending on mounting
+      pack_cmd(MOTOR_R_FRONT, 0.0, w_right, 0.0, 2.0, 0.0); 
       pack_cmd(MOTOR_R_BACK,  0.0, w_right, 0.0, 2.0, 0.0);
       
-      // Read replies and publish encoders
+      // Read CAN replies and publish JointState
       read_can_and_publish();
   }
 }
